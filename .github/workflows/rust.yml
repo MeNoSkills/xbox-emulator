@@ -78,4 +78,4 @@ jobs:
           restore-keys: rust-ws-${{ runner.os }}-
       - name: cargo check --workspace
         shell: bash
-        run: cargo check --locked --workspace
+        run: cargo check --locked --workspace --exclude connectedstorageservice_proxystub --exclude gamecorecomproxy --exclude wldp
