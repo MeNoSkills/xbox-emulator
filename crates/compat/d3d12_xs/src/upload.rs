@@ -22,6 +22,8 @@
 //!   * the PC texture is assumed to be in its creation state when the upload list runs
 //!     (the title's own barriers are not tracked);
 //!   * memory that is not committed/readable is skipped and retried later;
+//!   * a write racing the read is repaired on a later frame (hash changes again), but a
+//!     decommit racing the read would fault;
 //!   * Texture3D, multi-plane and render-target/depth placed textures are not mirrored.
 
 use core::ffi::c_void;
@@ -165,6 +167,11 @@ fn sparse_zero_enabled() -> bool {
     SW.on()
 }
 
+fn safe_reads() -> bool {
+    static SW: crate::live_sw::Sw = crate::live_sw::Sw::new("TOMBOX_UPLOAD_SAFE_READ", "upload_safe_read", false);
+    SW.on()
+}
+
 fn read_title_memory(addr: usize, dst: &mut [u8]) -> bool {
     if dst.is_empty() {
         return true;
@@ -177,6 +184,13 @@ fn read_title_memory(addr: usize, dst: &mut [u8]) -> bool {
 fn snapshot_title_memory(addr: usize, len: usize) -> Option<Vec<u8>> {
     let mut v = vec![0u8; len];
     read_title_memory(addr, &mut v).then_some(v)
+}
+
+fn with_title_bytes<R>(addr: usize, len: usize, safe: bool, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+    if !safe {
+        return Some(f(unsafe { core::slice::from_raw_parts(addr as *const u8, len) }));
+    }
+    snapshot_title_memory(addr, len).map(|v| f(&v))
 }
 
 fn hash_bytes(b: &[u8]) -> u64 {
@@ -565,7 +579,7 @@ unsafe fn check(up: &mut Uploader, idx: usize, hashed: &mut u64, fresh_only: boo
     let now = up.pumps;
     let t = &mut up.tracked[idx];
     let bpe = t.layout.bpe as usize;
-    let mut changed: Vec<(u32, Arc<SubMap>, u64, Arc<Vec<u8>>)> = Vec::new();
+    let mut changed: Vec<(u32, Arc<SubMap>, u64, Option<Arc<Vec<u8>>>)> = Vec::new();
     let mut unreadable = 0;
     let want: Vec<usize> = (0..t.fps.len()).filter(|&s| fresh_only != t.hashes[s].is_some()).collect();
     if want.is_empty() {
@@ -588,7 +602,7 @@ unsafe fn check(up: &mut Uploader, idx: usize, hashed: &mut u64, fresh_only: boo
         let base = t.p.va as usize;
         let (lo, len) = (base + map.lo, map.hi - map.lo);
         let sc = whole.clip(lo, len);
-        let snap: Arc<Vec<u8>>;
+        let mut snap: Option<Arc<Vec<u8>>> = None;
         if let Some((bp, st, pr, ty, rb, rs)) = sc.bad {
             let good: usize = sc.ok.iter().map(|(a, b)| b - a).sum();
             static LOGGED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
@@ -606,21 +620,30 @@ unsafe fn check(up: &mut Uploader, idx: usize, hashed: &mut u64, fresh_only: boo
             }
             let mut v = vec![0u8; len];
             for (a, b) in &sc.ok {
-                read_title_memory(*a, &mut v[a - lo..b - lo]);
+                if safe_reads() {
+                    read_title_memory(*a, &mut v[a - lo..b - lo]);
+                } else {
+                    core::ptr::copy_nonoverlapping(*a as *const u8, v.as_mut_ptr().add(a - lo), b - a);
+                }
             }
-            snap = Arc::new(v);
+            snap = Some(Arc::new(v));
             t.partial[sub as usize] = mark;
         } else {
-            match snapshot_title_memory(lo, len) {
-                Some(v) => snap = Arc::new(v),
-                None => {
-                    unreadable += 1;
-                    continue;
+            if safe_reads() {
+                match snapshot_title_memory(lo, len) {
+                    Some(v) => snap = Some(Arc::new(v)),
+                    None => {
+                        unreadable += 1;
+                        continue;
+                    }
                 }
             }
             t.partial[sub as usize] = 0;
         }
-        let mem: &[u8] = snap.as_slice();
+        let mem: &[u8] = match &snap {
+            Some(v) => v.as_slice(),
+            None => core::slice::from_raw_parts(lo as *const u8, len),
+        };
         let ck = std::time::Instant::now();
         let h = hash_bytes(mem);
         stage_time(2, ck);
@@ -677,12 +700,13 @@ unsafe fn check(up: &mut Uploader, idx: usize, hashed: &mut u64, fresh_only: boo
     }
     stage_time(3, ck);
     let ck = std::time::Instant::now();
+    let base = t.p.va as *const u8;
     let mut subs = Vec::with_capacity(changed.len());
     for (sub, map, h, snap) in changed {
         let fp = t.fps[sub as usize];
         let dst0 = data.add(fp.offset() as usize);
         let pitch = fp.row_pitch() as usize;
-        let src0 = snap.as_ptr().wrapping_sub(map.lo);
+        let src0 = match &snap { Some(v) => v.as_ptr().wrapping_sub(map.lo), None => base };
         detile_rows(dst0, pitch, src0, &map.offs, map.w_e as usize, map.h_e as usize, bpe);
         t.hashes[sub as usize] = Some(h);
         t.watch[sub as usize] = now + WATCH_PUMPS;
@@ -766,18 +790,11 @@ fn barrier(res: usize, before: u32, after: u32) -> [u64; 4] {
 }
 
 fn first_nonzero(ranges: &[(usize, usize)]) -> bool {
-    let mut chunk = vec![0u8; 64 << 10];
-    for &(a, b) in ranges {
-        let mut p = a;
-        while p < b {
-            let n = (b - p).min(chunk.len());
-            if !read_title_memory(p, &mut chunk[..n]) || chunk[..n].iter().any(|&x| x != 0) {
-                return true;
-            }
-            p += n;
-        }
-    }
-    false
+    first_nonzero_mode(ranges, safe_reads())
+}
+
+fn first_nonzero_mode(ranges: &[(usize, usize)], safe: bool) -> bool {
+    ranges.iter().any(|&(a, b)| with_title_bytes(a, b - a, safe, |s| s.iter().any(|&x| x != 0)).unwrap_or(true))
 }
 
 fn watch_pending(up: &mut Uploader) -> (u64, u64) {
@@ -810,8 +827,7 @@ fn watch_pending(up: &mut Uploader) -> (u64, u64) {
                 }
             } else if sc.bad.is_none() {
                 scanned += n as u64;
-                let Some(mem) = snapshot_title_memory(a, n) else { continue };
-                let h = hash_bytes(&mem);
+                let Some(h) = with_title_bytes(a, n, safe_reads(), hash_bytes) else { continue };
                 if t.hashes[sub] != Some(h) {
                     t.hashes[sub] = None;
                     changed += 1;
@@ -1162,15 +1178,42 @@ mod zero_watch_tests {
             core::ptr::write_bytes(base as *mut u8, 0xab, 3 * PAGE);
             let all = snapshot_title_memory(base, 3 * PAGE).expect("committed memory reads");
             assert!(all.iter().all(|&b| b == 0xab));
-            assert!(first_nonzero(&[(base, base + 3 * PAGE)]));
+            assert!(first_nonzero_mode(&[(base, base + 3 * PAGE)], true));
             assert_eq!(VirtualFree((base + PAGE) as *mut c_void, PAGE, 0x4000), 1);
             assert!(snapshot_title_memory(base, 3 * PAGE).is_none());
             assert!(snapshot_title_memory(base + PAGE, PAGE).is_none());
             assert!(snapshot_title_memory(base, PAGE).is_some());
             assert!(snapshot_title_memory(base + 2 * PAGE, PAGE).is_some());
-            assert!(first_nonzero(&[(base + PAGE, base + 2 * PAGE)]));
+            assert!(first_nonzero_mode(&[(base + PAGE, base + 2 * PAGE)], true));
+            assert!(with_title_bytes(base, 3 * PAGE, true, hash_bytes).is_none());
             VirtualFree(base as *mut c_void, 0, 0x8000);
         }
+    }
+
+    #[test]
+    fn default_reads_are_direct_and_the_safe_path_costs_one_copy() {
+        let mut worst_direct_ns = 0f64;
+        for &len in &[16usize << 10, 256 << 10, 4 << 20] {
+            let buf: Vec<u8> = (0..len).map(|i| (i * 31 + i / 7) as u8).collect();
+            let addr = buf.as_ptr() as usize;
+            let iters = ((64usize << 20) / len).max(4);
+            let time = |safe: bool| {
+                let t = std::time::Instant::now();
+                let mut acc = 0u64;
+                for _ in 0..iters {
+                    acc ^= with_title_bytes(addr, len, safe, hash_bytes).unwrap();
+                }
+                std::hint::black_box(acc);
+                t.elapsed().as_nanos() as f64 / iters as f64
+            };
+            time(false);
+            time(true);
+            let (direct, safe) = (time(false), time(true));
+            eprintln!("hash of {:>5} KiB: direct {direct:>10.0} ns/call, safe snapshot {safe:>10.0} ns/call (+{:.0}%)", len >> 10, (safe / direct - 1.0) * 100.0);
+            assert_eq!(with_title_bytes(addr, len, false, hash_bytes), with_title_bytes(addr, len, true, hash_bytes));
+            worst_direct_ns = worst_direct_ns.max(direct);
+        }
+        assert!(worst_direct_ns > 0.0);
     }
 
     #[test]
