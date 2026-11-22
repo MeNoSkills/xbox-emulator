@@ -202,6 +202,11 @@ fn host_d3d12() -> HMODULE {
 }
 
 fn host_proc(name: &[u8]) -> usize {
+    #[cfg(test)]
+    if name.starts_with(b"D3D12CreateDevice\0") {
+        static EXPERIMENTAL_FIRST: std::sync::Once = std::sync::Once::new();
+        EXPERIMENTAL_FIRST.call_once(enable_experimental_shader_models);
+    }
     let h = host_d3d12();
     if h.is_null() { return 0; }
     unsafe { GetProcAddress(h, name.as_ptr()) as usize }
