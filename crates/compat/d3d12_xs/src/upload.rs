@@ -163,8 +163,81 @@ fn sparse_zero_enabled() -> bool {
     SW.on()
 }
 
-fn with_title_bytes<R>(addr: usize, len: usize, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
-    crate::guard::guarded(|| f(unsafe { core::slice::from_raw_parts(addr as *const u8, len) }))
+struct HashJob {
+    addr: usize,
+    len: usize,
+    zero_test: bool,
+    hash: u64,
+    all_zero: bool,
+}
+
+struct NonzeroJob {
+    addr: usize,
+    len: usize,
+    found: bool,
+}
+
+struct CopyJob {
+    src: usize,
+    dst: usize,
+    len: usize,
+}
+
+struct DetileJob {
+    dst0: usize,
+    pitch: usize,
+    src0: usize,
+    offs: *const u32,
+    offs_len: usize,
+    w_e: usize,
+    y0: usize,
+    y1: usize,
+    bpe: usize,
+}
+
+const _: () = assert!(!core::mem::needs_drop::<HashJob>());
+const _: () = assert!(!core::mem::needs_drop::<NonzeroJob>());
+const _: () = assert!(!core::mem::needs_drop::<CopyJob>());
+const _: () = assert!(!core::mem::needs_drop::<DetileJob>());
+
+unsafe extern "C" fn hash_job(ctx: *mut c_void) {
+    let j = &mut *(ctx as *mut HashJob);
+    let s = core::slice::from_raw_parts(j.addr as *const u8, j.len);
+    j.hash = hash_bytes(s);
+    j.all_zero = j.zero_test && s.iter().all(|&b| b == 0);
+}
+
+unsafe extern "C" fn nonzero_job(ctx: *mut c_void) {
+    let j = &mut *(ctx as *mut NonzeroJob);
+    j.found = core::slice::from_raw_parts(j.addr as *const u8, j.len).iter().any(|&x| x != 0);
+}
+
+unsafe extern "C" fn copy_job(ctx: *mut c_void) {
+    let j = &*(ctx as *const CopyJob);
+    core::ptr::copy_nonoverlapping(j.src as *const u8, j.dst as *mut u8, j.len);
+}
+
+unsafe extern "C" fn detile_job(ctx: *mut c_void) {
+    let j = &*(ctx as *const DetileJob);
+    detile_span(j.dst0, j.pitch, j.src0, core::slice::from_raw_parts(j.offs, j.offs_len), j.w_e, j.y0..j.y1, j.bpe);
+}
+
+#[track_caller]
+fn hash_title(addr: usize, len: usize, zero_test: bool) -> Option<(u64, bool)> {
+    let mut j = HashJob { addr, len, zero_test, hash: 0, all_zero: false };
+    crate::guard::guarded(addr, len, hash_job, &mut j as *mut HashJob as *mut c_void).then_some((j.hash, j.all_zero))
+}
+
+#[track_caller]
+fn nonzero_title(addr: usize, len: usize) -> Option<bool> {
+    let mut j = NonzeroJob { addr, len, found: false };
+    crate::guard::guarded(addr, len, nonzero_job, &mut j as *mut NonzeroJob as *mut c_void).then_some(j.found)
+}
+
+#[track_caller]
+fn copy_title(src: usize, dst: usize, len: usize) -> bool {
+    let j = CopyJob { src, dst, len };
+    crate::guard::guarded(src, len, copy_job, &j as *const CopyJob as *mut c_void)
 }
 
 fn hash_bytes(b: &[u8]) -> u64 {
@@ -596,7 +669,7 @@ unsafe fn check(up: &mut Uploader, idx: usize, hashed: &mut u64, fresh_only: boo
             for (a, b) in &sc.ok {
                 let dst = v.as_mut_ptr().add(a - lo) as usize;
                 let (src, n) = (*a, b - a);
-                let _ = crate::guard::guarded(|| core::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, n));
+                let _ = copy_title(src, dst, n);
             }
             snap = Some(Arc::new(v));
             t.partial[sub as usize] = mark;
@@ -609,7 +682,7 @@ unsafe fn check(up: &mut Uploader, idx: usize, hashed: &mut u64, fresh_only: boo
         };
         let ck = std::time::Instant::now();
         let need_zero_test = t.hashes[sub as usize].is_none() && !gpu_owned;
-        let Some((h, all_zero)) = crate::guard::guarded(|| (hash_bytes(mem), need_zero_test && mem.iter().all(|&b| b == 0))) else {
+        let Some((h, all_zero)) = hash_title(mem.as_ptr() as usize, mem.len(), need_zero_test) else {
             unreadable += 1;
             continue;
         };
@@ -674,7 +747,7 @@ unsafe fn check(up: &mut Uploader, idx: usize, hashed: &mut u64, fresh_only: boo
         let dst0 = data.add(fp.offset() as usize);
         let pitch = fp.row_pitch() as usize;
         let src0 = match &snap { Some(v) => v.as_ptr().wrapping_sub(map.lo), None => base };
-        if !detile_rows(dst0, pitch, src0, &map.offs, map.w_e as usize, map.h_e as usize, bpe) {
+        if !detile_rows(dst0, pitch, src0, (src0 as usize).wrapping_add(map.lo), map.hi - map.lo, &map.offs, map.w_e as usize, map.h_e as usize, bpe) {
             up.unreadable += 1;
             continue;
         }
@@ -736,39 +809,50 @@ unsafe fn detile_span(dst0: usize, pitch: usize, src0: usize, offs: &[u32], w_e:
     }
 }
 
-unsafe fn detile_rows(dst0: *mut u8, pitch: usize, src0: *const u8, offs: &[u32], w_e: usize, h_e: usize, bpe: usize) -> bool {
-    let (d, s) = (dst0 as usize, src0 as usize);
+#[track_caller]
+fn detile_guarded(title_lo: usize, title_len: usize, job: &DetileJob) -> bool {
+    crate::guard::guarded(title_lo, title_len, detile_job, job as *const DetileJob as *mut c_void)
+}
+
+unsafe fn detile_rows(dst0: *mut u8, pitch: usize, src0: *const u8, title_lo: usize, title_len: usize, offs: &[u32], w_e: usize, h_e: usize, bpe: usize) -> bool {
+    let job = |y0: usize, y1: usize| DetileJob { dst0: dst0 as usize, pitch, src0: src0 as usize, offs: offs.as_ptr(), offs_len: offs.len(), w_e, y0, y1, bpe };
     let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(1, 8);
     if w_e * h_e * bpe < PARALLEL_DETILE_BYTES || workers == 1 || h_e < 2 {
-        return crate::guard::guarded(|| detile_span(d, pitch, s, offs, w_e, 0..h_e, bpe)).is_some();
+        return detile_guarded(title_lo, title_len, &job(0, h_e));
     }
     let chunk = h_e.div_ceil(workers);
     let faulted = core::sync::atomic::AtomicBool::new(false);
     std::thread::scope(|sc| {
         for k in 1..workers {
-            let r = (k * chunk).min(h_e)..((k + 1) * chunk).min(h_e);
-            if !r.is_empty() {
-                let faulted = &faulted;
+            let (y0, y1) = ((k * chunk).min(h_e), ((k + 1) * chunk).min(h_e));
+            if y0 < y1 {
+                let (faulted, job) = (&faulted, job(y0, y1));
+                let job = SendJob(job);
                 sc.spawn(move || {
-                    if crate::guard::guarded(|| unsafe { detile_span(d, pitch, s, offs, w_e, r, bpe) }).is_none() {
+                    let job = job;
+                    if !detile_guarded(title_lo, title_len, &job.0) {
                         faulted.store(true, core::sync::atomic::Ordering::Relaxed);
                     }
                 });
             }
         }
-        if crate::guard::guarded(|| detile_span(d, pitch, s, offs, w_e, 0..chunk.min(h_e), bpe)).is_none() {
+        if !detile_guarded(title_lo, title_len, &job(0, chunk.min(h_e))) {
             faulted.store(true, core::sync::atomic::Ordering::Relaxed);
         }
     });
     !faulted.load(core::sync::atomic::Ordering::Relaxed)
 }
 
+struct SendJob(DetileJob);
+
+unsafe impl Send for SendJob {}
+
 fn barrier(res: usize, before: u32, after: u32) -> [u64; 4] {
     [0, res as u64, 0xffff_ffffu64 | ((before as u64) << 32), after as u64]
 }
 
 fn first_nonzero(ranges: &[(usize, usize)]) -> bool {
-    ranges.iter().any(|&(a, b)| with_title_bytes(a, b - a, |s| s.iter().any(|&x| x != 0)).unwrap_or(true))
+    ranges.iter().any(|&(a, b)| nonzero_title(a, b - a).unwrap_or(true))
 }
 
 fn watch_pending(up: &mut Uploader) -> (u64, u64) {
@@ -801,7 +885,7 @@ fn watch_pending(up: &mut Uploader) -> (u64, u64) {
                 }
             } else if sc.bad.is_none() {
                 scanned += n as u64;
-                let Some(h) = with_title_bytes(a, n, hash_bytes) else { continue };
+                let Some((h, _)) = hash_title(a, n, false) else { continue };
                 if t.hashes[sub] != Some(h) {
                     t.hashes[sub] = None;
                     changed += 1;
@@ -1150,18 +1234,21 @@ mod zero_watch_tests {
             let base = VirtualAlloc(core::ptr::null_mut(), 3 * PAGE, 0x3000, 0x04) as usize;
             assert_ne!(base, 0);
             core::ptr::write_bytes(base as *mut u8, 0xab, 3 * PAGE);
-            assert!(with_title_bytes(base, 3 * PAGE, hash_bytes).is_some());
+            assert!(hash_title(base, 3 * PAGE, true).is_some());
             assert!(first_nonzero(&[(base, base + 3 * PAGE)]));
             assert_eq!(VirtualFree((base + PAGE) as *mut c_void, PAGE, 0x4000), 1);
-            assert!(with_title_bytes(base, 3 * PAGE, hash_bytes).is_none());
-            assert!(with_title_bytes(base + PAGE, PAGE, hash_bytes).is_none());
-            assert!(with_title_bytes(base, PAGE, hash_bytes).is_some());
-            assert!(with_title_bytes(base + 2 * PAGE, PAGE, hash_bytes).is_some());
+            assert!(hash_title(base, 3 * PAGE, true).is_none());
+            assert!(hash_title(base + PAGE, PAGE, false).is_none());
+            assert!(hash_title(base, PAGE, false).is_some());
+            assert!(hash_title(base + 2 * PAGE, PAGE, false).is_some());
             assert!(first_nonzero(&[(base + PAGE, base + 2 * PAGE)]));
+            let mut copy = vec![0u8; 3 * PAGE];
+            assert!(copy_title(base, copy.as_mut_ptr() as usize, PAGE));
+            assert!(!copy_title(base + PAGE, copy.as_mut_ptr() as usize, PAGE));
             let (w, h, bpe) = (32usize, 128usize, 4usize);
             let offs: Vec<u32> = (0..w * h).map(|i| ((i % (3 * PAGE / bpe)) * bpe) as u32).collect();
             let mut dst = vec![0u8; w * h * bpe];
-            assert!(!detile_rows(dst.as_mut_ptr(), w * bpe, base as *const u8, &offs, w, h, bpe));
+            assert!(!detile_rows(dst.as_mut_ptr(), w * bpe, base as *const u8, base, 3 * PAGE, &offs, w, h, bpe));
             VirtualFree(base as *mut c_void, 0, 0x8000);
         }
     }
@@ -1177,7 +1264,7 @@ mod zero_watch_tests {
                 let mut acc = 0u64;
                 for _ in 0..iters {
                     acc ^= if guarded {
-                        with_title_bytes(addr, len, hash_bytes).unwrap()
+                        hash_title(addr, len, false).unwrap().0
                     } else {
                         hash_bytes(unsafe { core::slice::from_raw_parts(addr as *const u8, len) })
                     };
@@ -1189,7 +1276,7 @@ mod zero_watch_tests {
             time(true);
             let (direct, guarded) = (time(false), time(true));
             eprintln!("hash of {:>5} KiB: unguarded {direct:>10.0} ns/call, guarded {guarded:>10.0} ns/call ({:+.1}%)", len >> 10, (guarded / direct - 1.0) * 100.0);
-            assert_eq!(with_title_bytes(addr, len, hash_bytes), Some(hash_bytes(&buf)));
+            assert_eq!(hash_title(addr, len, true), Some((hash_bytes(&buf), buf.iter().all(|&b| b == 0))));
         }
     }
 
@@ -1212,7 +1299,7 @@ mod zero_watch_tests {
         let mut a = vec![0u8; pitch * h];
         let mut b = vec![0u8; pitch * h];
         unsafe {
-            assert!(detile_rows(a.as_mut_ptr(), pitch, src.as_ptr(), &offs, w, h, bpe));
+            assert!(detile_rows(a.as_mut_ptr(), pitch, src.as_ptr(), src.as_ptr() as usize, src.len(), &offs, w, h, bpe));
             detile_span(b.as_mut_ptr() as usize, pitch, src.as_ptr() as usize, &offs, w, 0..h, bpe);
         }
         assert!(w * h * bpe >= PARALLEL_DETILE_BYTES);
