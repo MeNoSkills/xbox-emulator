@@ -32,8 +32,6 @@ use crate::placed::Placed;
 
 extern "system" {
     fn VirtualQuery(addr: *const c_void, mbi: *mut Mbi, len: usize) -> usize;
-    fn GetCurrentProcess() -> *mut c_void;
-    fn ReadProcessMemory(process: *mut c_void, base: *const c_void, buf: *mut c_void, len: usize, read: *mut usize) -> i32;
     fn GetModuleHandleA(n: *const u8) -> *mut c_void;
     fn LoadLibraryA(n: *const u8) -> *mut c_void;
     fn GetProcAddress(h: *mut c_void, n: *const u8) -> *mut c_void;
@@ -165,30 +163,8 @@ fn sparse_zero_enabled() -> bool {
     SW.on()
 }
 
-fn safe_reads() -> bool {
-    static SW: crate::live_sw::Sw = crate::live_sw::Sw::new("TOMBOX_UPLOAD_SAFE_READ", "upload_safe_read", false);
-    SW.on()
-}
-
-fn read_title_memory(addr: usize, dst: &mut [u8]) -> bool {
-    if dst.is_empty() {
-        return true;
-    }
-    let mut got = 0usize;
-    let ok = unsafe { ReadProcessMemory(GetCurrentProcess(), addr as *const c_void, dst.as_mut_ptr() as *mut c_void, dst.len(), &mut got) };
-    ok != 0 && got == dst.len()
-}
-
-fn snapshot_title_memory(addr: usize, len: usize) -> Option<Vec<u8>> {
-    let mut v = vec![0u8; len];
-    read_title_memory(addr, &mut v).then_some(v)
-}
-
-fn with_title_bytes<R>(addr: usize, len: usize, safe: bool, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
-    if !safe {
-        return Some(f(unsafe { core::slice::from_raw_parts(addr as *const u8, len) }));
-    }
-    snapshot_title_memory(addr, len).map(|v| f(&v))
+fn with_title_bytes<R>(addr: usize, len: usize, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+    crate::guard::guarded(|| f(unsafe { core::slice::from_raw_parts(addr as *const u8, len) }))
 }
 
 fn hash_bytes(b: &[u8]) -> u64 {
@@ -618,24 +594,13 @@ unsafe fn check(up: &mut Uploader, idx: usize, hashed: &mut u64, fresh_only: boo
             }
             let mut v = vec![0u8; len];
             for (a, b) in &sc.ok {
-                if safe_reads() {
-                    read_title_memory(*a, &mut v[a - lo..b - lo]);
-                } else {
-                    core::ptr::copy_nonoverlapping(*a as *const u8, v.as_mut_ptr().add(a - lo), b - a);
-                }
+                let dst = v.as_mut_ptr().add(a - lo) as usize;
+                let (src, n) = (*a, b - a);
+                let _ = crate::guard::guarded(|| core::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, n));
             }
             snap = Some(Arc::new(v));
             t.partial[sub as usize] = mark;
         } else {
-            if safe_reads() {
-                match snapshot_title_memory(lo, len) {
-                    Some(v) => snap = Some(Arc::new(v)),
-                    None => {
-                        unreadable += 1;
-                        continue;
-                    }
-                }
-            }
             t.partial[sub as usize] = 0;
         }
         let mem: &[u8] = match &snap {
@@ -643,10 +608,14 @@ unsafe fn check(up: &mut Uploader, idx: usize, hashed: &mut u64, fresh_only: boo
             None => core::slice::from_raw_parts(lo as *const u8, len),
         };
         let ck = std::time::Instant::now();
-        let h = hash_bytes(mem);
+        let need_zero_test = t.hashes[sub as usize].is_none() && !gpu_owned;
+        let Some((h, all_zero)) = crate::guard::guarded(|| (hash_bytes(mem), need_zero_test && mem.iter().all(|&b| b == 0))) else {
+            unreadable += 1;
+            continue;
+        };
         stage_time(2, ck);
         *hashed += mem.len() as u64;
-        if t.hashes[sub as usize].is_none() && (gpu_owned || mem.iter().all(|&b| b == 0)) {
+        if t.hashes[sub as usize].is_none() && (gpu_owned || all_zero) {
             // Never written by the title (fresh committed pages are zero). Do not upload:
             // the title may instead fill this subresource with a GPU copy
             // (CopyTextureRegion), which an upload of zeros could overwrite.
@@ -705,7 +674,10 @@ unsafe fn check(up: &mut Uploader, idx: usize, hashed: &mut u64, fresh_only: boo
         let dst0 = data.add(fp.offset() as usize);
         let pitch = fp.row_pitch() as usize;
         let src0 = match &snap { Some(v) => v.as_ptr().wrapping_sub(map.lo), None => base };
-        detile_rows(dst0, pitch, src0, &map.offs, map.w_e as usize, map.h_e as usize, bpe);
+        if !detile_rows(dst0, pitch, src0, &map.offs, map.w_e as usize, map.h_e as usize, bpe) {
+            up.unreadable += 1;
+            continue;
+        }
         t.hashes[sub as usize] = Some(h);
         t.watch[sub as usize] = now + WATCH_PUMPS;
         t.hot = t.hot.max(now + WATCH_PUMPS);
@@ -764,23 +736,31 @@ unsafe fn detile_span(dst0: usize, pitch: usize, src0: usize, offs: &[u32], w_e:
     }
 }
 
-unsafe fn detile_rows(dst0: *mut u8, pitch: usize, src0: *const u8, offs: &[u32], w_e: usize, h_e: usize, bpe: usize) {
+unsafe fn detile_rows(dst0: *mut u8, pitch: usize, src0: *const u8, offs: &[u32], w_e: usize, h_e: usize, bpe: usize) -> bool {
     let (d, s) = (dst0 as usize, src0 as usize);
     let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(1, 8);
     if w_e * h_e * bpe < PARALLEL_DETILE_BYTES || workers == 1 || h_e < 2 {
-        detile_span(d, pitch, s, offs, w_e, 0..h_e, bpe);
-        return;
+        return crate::guard::guarded(|| detile_span(d, pitch, s, offs, w_e, 0..h_e, bpe)).is_some();
     }
     let chunk = h_e.div_ceil(workers);
+    let faulted = core::sync::atomic::AtomicBool::new(false);
     std::thread::scope(|sc| {
         for k in 1..workers {
             let r = (k * chunk).min(h_e)..((k + 1) * chunk).min(h_e);
             if !r.is_empty() {
-                sc.spawn(move || unsafe { detile_span(d, pitch, s, offs, w_e, r, bpe) });
+                let faulted = &faulted;
+                sc.spawn(move || {
+                    if crate::guard::guarded(|| unsafe { detile_span(d, pitch, s, offs, w_e, r, bpe) }).is_none() {
+                        faulted.store(true, core::sync::atomic::Ordering::Relaxed);
+                    }
+                });
             }
         }
-        detile_span(d, pitch, s, offs, w_e, 0..chunk.min(h_e), bpe);
+        if crate::guard::guarded(|| detile_span(d, pitch, s, offs, w_e, 0..chunk.min(h_e), bpe)).is_none() {
+            faulted.store(true, core::sync::atomic::Ordering::Relaxed);
+        }
     });
+    !faulted.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 fn barrier(res: usize, before: u32, after: u32) -> [u64; 4] {
@@ -788,11 +768,7 @@ fn barrier(res: usize, before: u32, after: u32) -> [u64; 4] {
 }
 
 fn first_nonzero(ranges: &[(usize, usize)]) -> bool {
-    first_nonzero_mode(ranges, safe_reads())
-}
-
-fn first_nonzero_mode(ranges: &[(usize, usize)], safe: bool) -> bool {
-    ranges.iter().any(|&(a, b)| with_title_bytes(a, b - a, safe, |s| s.iter().any(|&x| x != 0)).unwrap_or(true))
+    ranges.iter().any(|&(a, b)| with_title_bytes(a, b - a, |s| s.iter().any(|&x| x != 0)).unwrap_or(true))
 }
 
 fn watch_pending(up: &mut Uploader) -> (u64, u64) {
@@ -825,7 +801,7 @@ fn watch_pending(up: &mut Uploader) -> (u64, u64) {
                 }
             } else if sc.bad.is_none() {
                 scanned += n as u64;
-                let Some(h) = with_title_bytes(a, n, safe_reads(), hash_bytes) else { continue };
+                let Some(h) = with_title_bytes(a, n, hash_bytes) else { continue };
                 if t.hashes[sub] != Some(h) {
                     t.hashes[sub] = None;
                     changed += 1;
@@ -1164,7 +1140,7 @@ mod zero_watch_tests {
     }
 
     #[test]
-    fn decommitted_memory_fails_the_snapshot_instead_of_faulting() {
+    fn decommitted_memory_skips_the_read_instead_of_faulting() {
         extern "system" {
             fn VirtualAlloc(addr: *mut c_void, len: usize, ty: u32, protect: u32) -> *mut c_void;
             fn VirtualFree(addr: *mut c_void, len: usize, ty: u32) -> i32;
@@ -1174,44 +1150,47 @@ mod zero_watch_tests {
             let base = VirtualAlloc(core::ptr::null_mut(), 3 * PAGE, 0x3000, 0x04) as usize;
             assert_ne!(base, 0);
             core::ptr::write_bytes(base as *mut u8, 0xab, 3 * PAGE);
-            let all = snapshot_title_memory(base, 3 * PAGE).expect("committed memory reads");
-            assert!(all.iter().all(|&b| b == 0xab));
-            assert!(first_nonzero_mode(&[(base, base + 3 * PAGE)], true));
+            assert!(with_title_bytes(base, 3 * PAGE, hash_bytes).is_some());
+            assert!(first_nonzero(&[(base, base + 3 * PAGE)]));
             assert_eq!(VirtualFree((base + PAGE) as *mut c_void, PAGE, 0x4000), 1);
-            assert!(snapshot_title_memory(base, 3 * PAGE).is_none());
-            assert!(snapshot_title_memory(base + PAGE, PAGE).is_none());
-            assert!(snapshot_title_memory(base, PAGE).is_some());
-            assert!(snapshot_title_memory(base + 2 * PAGE, PAGE).is_some());
-            assert!(first_nonzero_mode(&[(base + PAGE, base + 2 * PAGE)], true));
-            assert!(with_title_bytes(base, 3 * PAGE, true, hash_bytes).is_none());
+            assert!(with_title_bytes(base, 3 * PAGE, hash_bytes).is_none());
+            assert!(with_title_bytes(base + PAGE, PAGE, hash_bytes).is_none());
+            assert!(with_title_bytes(base, PAGE, hash_bytes).is_some());
+            assert!(with_title_bytes(base + 2 * PAGE, PAGE, hash_bytes).is_some());
+            assert!(first_nonzero(&[(base + PAGE, base + 2 * PAGE)]));
+            let (w, h, bpe) = (32usize, 128usize, 4usize);
+            let offs: Vec<u32> = (0..w * h).map(|i| ((i % (3 * PAGE / bpe)) * bpe) as u32).collect();
+            let mut dst = vec![0u8; w * h * bpe];
+            assert!(!detile_rows(dst.as_mut_ptr(), w * bpe, base as *const u8, &offs, w, h, bpe));
             VirtualFree(base as *mut c_void, 0, 0x8000);
         }
     }
 
     #[test]
-    fn default_reads_are_direct_and_the_safe_path_costs_one_copy() {
-        let mut worst_direct_ns = 0f64;
+    fn guarded_reads_cost_one_call_per_range_not_per_byte() {
         for &len in &[16usize << 10, 256 << 10, 4 << 20] {
             let buf: Vec<u8> = (0..len).map(|i| (i * 31 + i / 7) as u8).collect();
             let addr = buf.as_ptr() as usize;
             let iters = ((64usize << 20) / len).max(4);
-            let time = |safe: bool| {
+            let time = |guarded: bool| {
                 let t = std::time::Instant::now();
                 let mut acc = 0u64;
                 for _ in 0..iters {
-                    acc ^= with_title_bytes(addr, len, safe, hash_bytes).unwrap();
+                    acc ^= if guarded {
+                        with_title_bytes(addr, len, hash_bytes).unwrap()
+                    } else {
+                        hash_bytes(unsafe { core::slice::from_raw_parts(addr as *const u8, len) })
+                    };
                 }
                 std::hint::black_box(acc);
                 t.elapsed().as_nanos() as f64 / iters as f64
             };
             time(false);
             time(true);
-            let (direct, safe) = (time(false), time(true));
-            eprintln!("hash of {:>5} KiB: direct {direct:>10.0} ns/call, safe snapshot {safe:>10.0} ns/call (+{:.0}%)", len >> 10, (safe / direct - 1.0) * 100.0);
-            assert_eq!(with_title_bytes(addr, len, false, hash_bytes), with_title_bytes(addr, len, true, hash_bytes));
-            worst_direct_ns = worst_direct_ns.max(direct);
+            let (direct, guarded) = (time(false), time(true));
+            eprintln!("hash of {:>5} KiB: unguarded {direct:>10.0} ns/call, guarded {guarded:>10.0} ns/call ({:+.1}%)", len >> 10, (guarded / direct - 1.0) * 100.0);
+            assert_eq!(with_title_bytes(addr, len, hash_bytes), Some(hash_bytes(&buf)));
         }
-        assert!(worst_direct_ns > 0.0);
     }
 
     #[test]
@@ -1233,7 +1212,7 @@ mod zero_watch_tests {
         let mut a = vec![0u8; pitch * h];
         let mut b = vec![0u8; pitch * h];
         unsafe {
-            detile_rows(a.as_mut_ptr(), pitch, src.as_ptr(), &offs, w, h, bpe);
+            assert!(detile_rows(a.as_mut_ptr(), pitch, src.as_ptr(), &offs, w, h, bpe));
             detile_span(b.as_mut_ptr() as usize, pitch, src.as_ptr() as usize, &offs, w, 0..h, bpe);
         }
         assert!(w * h * bpe >= PARALLEL_DETILE_BYTES);

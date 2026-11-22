@@ -55,6 +55,7 @@ mod perf;
 mod present_wait;
 mod qwait;
 mod placed;
+mod guard;
 mod upload;
 mod reaper;
 mod rtcap;
