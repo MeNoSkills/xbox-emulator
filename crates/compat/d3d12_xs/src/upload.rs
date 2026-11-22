@@ -22,8 +22,6 @@
 //!   * the PC texture is assumed to be in its creation state when the upload list runs
 //!     (the title's own barriers are not tracked);
 //!   * memory that is not committed/readable is skipped and retried later;
-//!   * a write racing the read is repaired on a later frame (hash changes again), but a
-//!     decommit racing the read would fault;
 //!   * Texture3D, multi-plane and render-target/depth placed textures are not mirrored.
 
 use core::ffi::c_void;
@@ -34,6 +32,8 @@ use crate::placed::Placed;
 
 extern "system" {
     fn VirtualQuery(addr: *const c_void, mbi: *mut Mbi, len: usize) -> usize;
+    fn GetCurrentProcess() -> *mut c_void;
+    fn ReadProcessMemory(process: *mut c_void, base: *const c_void, buf: *mut c_void, len: usize, read: *mut usize) -> i32;
     fn GetModuleHandleA(n: *const u8) -> *mut c_void;
     fn LoadLibraryA(n: *const u8) -> *mut c_void;
     fn GetProcAddress(h: *mut c_void, n: *const u8) -> *mut c_void;
@@ -163,6 +163,20 @@ fn scan_subs(t: &Tracked, subs: &[usize]) -> Option<Scan> {
 fn sparse_zero_enabled() -> bool {
     static SW: crate::live_sw::Sw = crate::live_sw::Sw::new("TOMBOX_SPARSE_ZERO", "sparse_zero", true);
     SW.on()
+}
+
+fn read_title_memory(addr: usize, dst: &mut [u8]) -> bool {
+    if dst.is_empty() {
+        return true;
+    }
+    let mut got = 0usize;
+    let ok = unsafe { ReadProcessMemory(GetCurrentProcess(), addr as *const c_void, dst.as_mut_ptr() as *mut c_void, dst.len(), &mut got) };
+    ok != 0 && got == dst.len()
+}
+
+fn snapshot_title_memory(addr: usize, len: usize) -> Option<Vec<u8>> {
+    let mut v = vec![0u8; len];
+    read_title_memory(addr, &mut v).then_some(v)
 }
 
 fn hash_bytes(b: &[u8]) -> u64 {
@@ -551,7 +565,7 @@ unsafe fn check(up: &mut Uploader, idx: usize, hashed: &mut u64, fresh_only: boo
     let now = up.pumps;
     let t = &mut up.tracked[idx];
     let bpe = t.layout.bpe as usize;
-    let mut changed: Vec<(u32, Arc<SubMap>, u64, Option<Arc<Vec<u8>>>)> = Vec::new();
+    let mut changed: Vec<(u32, Arc<SubMap>, u64, Arc<Vec<u8>>)> = Vec::new();
     let mut unreadable = 0;
     let want: Vec<usize> = (0..t.fps.len()).filter(|&s| fresh_only != t.hashes[s].is_some()).collect();
     if want.is_empty() {
@@ -574,7 +588,7 @@ unsafe fn check(up: &mut Uploader, idx: usize, hashed: &mut u64, fresh_only: boo
         let base = t.p.va as usize;
         let (lo, len) = (base + map.lo, map.hi - map.lo);
         let sc = whole.clip(lo, len);
-        let mut snap: Option<Arc<Vec<u8>>> = None;
+        let snap: Arc<Vec<u8>>;
         if let Some((bp, st, pr, ty, rb, rs)) = sc.bad {
             let good: usize = sc.ok.iter().map(|(a, b)| b - a).sum();
             static LOGGED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
@@ -592,17 +606,21 @@ unsafe fn check(up: &mut Uploader, idx: usize, hashed: &mut u64, fresh_only: boo
             }
             let mut v = vec![0u8; len];
             for (a, b) in &sc.ok {
-                core::ptr::copy_nonoverlapping(*a as *const u8, v.as_mut_ptr().add(a - lo), b - a);
+                read_title_memory(*a, &mut v[a - lo..b - lo]);
             }
-            snap = Some(Arc::new(v));
+            snap = Arc::new(v);
             t.partial[sub as usize] = mark;
         } else {
+            match snapshot_title_memory(lo, len) {
+                Some(v) => snap = Arc::new(v),
+                None => {
+                    unreadable += 1;
+                    continue;
+                }
+            }
             t.partial[sub as usize] = 0;
         }
-        let mem: &[u8] = match &snap {
-            Some(v) => v.as_slice(),
-            None => core::slice::from_raw_parts(lo as *const u8, len),
-        };
+        let mem: &[u8] = snap.as_slice();
         let ck = std::time::Instant::now();
         let h = hash_bytes(mem);
         stage_time(2, ck);
@@ -659,13 +677,12 @@ unsafe fn check(up: &mut Uploader, idx: usize, hashed: &mut u64, fresh_only: boo
     }
     stage_time(3, ck);
     let ck = std::time::Instant::now();
-    let base = t.p.va as *const u8;
     let mut subs = Vec::with_capacity(changed.len());
     for (sub, map, h, snap) in changed {
         let fp = t.fps[sub as usize];
         let dst0 = data.add(fp.offset() as usize);
         let pitch = fp.row_pitch() as usize;
-        let src0 = match &snap { Some(v) => v.as_ptr().wrapping_sub(map.lo), None => base };
+        let src0 = snap.as_ptr().wrapping_sub(map.lo);
         detile_rows(dst0, pitch, src0, &map.offs, map.w_e as usize, map.h_e as usize, bpe);
         t.hashes[sub as usize] = Some(h);
         t.watch[sub as usize] = now + WATCH_PUMPS;
@@ -749,7 +766,18 @@ fn barrier(res: usize, before: u32, after: u32) -> [u64; 4] {
 }
 
 fn first_nonzero(ranges: &[(usize, usize)]) -> bool {
-    ranges.iter().any(|&(a, b)| unsafe { core::slice::from_raw_parts(a as *const u8, b - a) }.iter().any(|&x| x != 0))
+    let mut chunk = vec![0u8; 64 << 10];
+    for &(a, b) in ranges {
+        let mut p = a;
+        while p < b {
+            let n = (b - p).min(chunk.len());
+            if !read_title_memory(p, &mut chunk[..n]) || chunk[..n].iter().any(|&x| x != 0) {
+                return true;
+            }
+            p += n;
+        }
+    }
+    false
 }
 
 fn watch_pending(up: &mut Uploader) -> (u64, u64) {
@@ -782,7 +810,8 @@ fn watch_pending(up: &mut Uploader) -> (u64, u64) {
                 }
             } else if sc.bad.is_none() {
                 scanned += n as u64;
-                let h = hash_bytes(unsafe { core::slice::from_raw_parts(a as *const u8, n) });
+                let Some(mem) = snapshot_title_memory(a, n) else { continue };
+                let h = hash_bytes(&mem);
                 if t.hashes[sub] != Some(h) {
                     t.hashes[sub] = None;
                     changed += 1;
@@ -1118,6 +1147,30 @@ mod zero_watch_tests {
         assert!(first_nonzero(&[(a, a + 4096)]));
         assert!(!first_nonzero(&[(a, a + 2048)]));
         assert!(first_nonzero(&[(a, a + 16), (a + 2990, a + 3001)]));
+    }
+
+    #[test]
+    fn decommitted_memory_fails_the_snapshot_instead_of_faulting() {
+        extern "system" {
+            fn VirtualAlloc(addr: *mut c_void, len: usize, ty: u32, protect: u32) -> *mut c_void;
+            fn VirtualFree(addr: *mut c_void, len: usize, ty: u32) -> i32;
+        }
+        const PAGE: usize = 4096;
+        unsafe {
+            let base = VirtualAlloc(core::ptr::null_mut(), 3 * PAGE, 0x3000, 0x04) as usize;
+            assert_ne!(base, 0);
+            core::ptr::write_bytes(base as *mut u8, 0xab, 3 * PAGE);
+            let all = snapshot_title_memory(base, 3 * PAGE).expect("committed memory reads");
+            assert!(all.iter().all(|&b| b == 0xab));
+            assert!(first_nonzero(&[(base, base + 3 * PAGE)]));
+            assert_eq!(VirtualFree((base + PAGE) as *mut c_void, PAGE, 0x4000), 1);
+            assert!(snapshot_title_memory(base, 3 * PAGE).is_none());
+            assert!(snapshot_title_memory(base + PAGE, PAGE).is_none());
+            assert!(snapshot_title_memory(base, PAGE).is_some());
+            assert!(snapshot_title_memory(base + 2 * PAGE, PAGE).is_some());
+            assert!(first_nonzero(&[(base + PAGE, base + 2 * PAGE)]));
+            VirtualFree(base as *mut c_void, 0, 0x8000);
+        }
     }
 
     #[test]
