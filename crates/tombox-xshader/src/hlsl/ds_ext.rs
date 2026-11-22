@@ -97,9 +97,6 @@ impl Emitter<'_> {
         let d = *ins.dst.first().ok_or("permute: no vdst")?;
         let swizzle = ins.mnemonic == "ds_swizzle_b32";
         let off = ins.aux.imm as u32 & 0xffff;
-        if swizzle && off >= 0xc000 {
-            return Err(format!("ds_swizzle_b32 offset {off:#06x}: the rotate and FFT modes are not lowered"));
-        }
         let (addr, data) = if swizzle { (ins.src[0], ins.src[0]) } else { (ins.src[0], ins.src[1]) };
         self.touch(&addr);
         self.touch(&data);
@@ -107,10 +104,19 @@ impl Emitter<'_> {
         let t = self.tmp;
         self.tmp += 1;
         let source_lane = |lane: String| {
-            if off & 0x8000 != 0 {
+            let mask = off & 0x1f;
+            if off & 0x8000 == 0 {
+                format!("((({lane} & {mask:#x}u) | {:#x}u) ^ {:#x}u)", (off >> 5) & 0x1f, (off >> 10) & 0x1f)
+            } else if off < 0xc000 {
                 format!("(({lane} & ~3u) | (({:#x}u >> (({lane} & 3u) * 2u)) & 3u))", off & 0xff)
+            } else if off < 0xe000 {
+                let n = (off >> 5) & 0x1f;
+                let amount = if off & 0x400 == 0 { n } else { (32 - n) & 31 };
+                format!("(({lane} & {mask:#x}u) | ((({lane} + {amount}u) & 31u) & {:#x}u))", !mask & 0x1f)
             } else {
-                format!("((({lane} & {:#x}u) | {:#x}u) ^ {:#x}u)", off & 0x1f, (off >> 5) & 0x1f, (off >> 10) & 0x1f)
+                let shift = 27 + mask.count_ones();
+                let reversed = if shift >= 32 { "0u".to_string() } else { format!("(reversebits({lane}) >> {shift}u)") };
+                format!("({reversed} | ({lane} & {mask:#x}u))")
             }
         };
         if swizzle {

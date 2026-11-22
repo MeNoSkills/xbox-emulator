@@ -336,17 +336,52 @@ fn ds_swizzle_compute() {
     run_cs_cases("ds_swizzle_cs", &cs);
 }
 
+fn rotate_source(off: u32, lane: u32) -> u32 {
+    let mask = off & 31;
+    let n = (off >> 5) & 31;
+    let amount = if off & 0x400 == 0 { n } else { (32 - n) % 32 };
+    (lane & mask) | (((lane + amount) & 31) & !mask & 31)
+}
+
+fn fft_source(off: u32, lane: u32) -> u32 {
+    let mask = off & 31;
+    let reversed = (0..5).fold(0, |a, b| a | (((lane >> b) & 1) << (4 - b)));
+    (reversed >> mask.count_ones()) | (lane & mask)
+}
+
 #[test]
-fn ds_swizzle_rotate_and_fft_are_refused_in_compute() {
-    for &off in &[0xc000u32, 0xc01f, 0xe000, 0xe01f, 0xffff] {
-        let op = ds(0x35, off, 2, 0, 0, 10);
-        let w = cs_prog(&op, &[10]);
-        let e = match translate(&cs_extract(&w, T)) {
-            Ok(_) => panic!("ds_swizzle {off:#06x} translated"),
-            Err(e) => e,
-        };
-        assert!(e.contains("rotate and FFT"), "{off:#06x}: {e}");
+fn ds_swizzle_rotate_and_fft_compute() {
+    assert_eq!((0..4).map(|l| fft_source(0xe000, l)).collect::<Vec<_>>(), [0, 16, 8, 24]);
+    assert!((0..32).all(|l| fft_source(0xe01f, l) == l));
+    assert_eq!([1, 16, 17].map(|l| fft_source(0xe010, l)), [8, 16, 24]);
+    assert_eq!((0..4).map(|l| rotate_source(0xc020, l)).collect::<Vec<_>>(), [1, 2, 3, 4]);
+    assert_eq!((0..4).map(|l| rotate_source(0xc420, l)).collect::<Vec<_>>(), [31, 0, 1, 2]);
+    assert_eq!((0..8).map(|l| rotate_source(0xc060 | 0x18, l)).collect::<Vec<_>>(), [3, 4, 5, 6, 7, 0, 1, 2]);
+    let g = |t: u32| t & !31;
+    let mut cs = Vec::new();
+    let mut offsets = Vec::new();
+    for dir in [0u32, 1] {
+        for n in [0u32, 1, 3, 31] {
+            for mask in [0x00u32, 0x18, 0x1c, 0x01] {
+                offsets.push(0xc000 | (dir << 10) | (n << 5) | mask);
+            }
+        }
     }
+    offsets.extend([0xd800u32 | 0x0460 | 0x18, 0xc000 | (3 << 5) | 0x1f, 0xdbff]);
+    for &off in &offsets {
+        let op = ds(0x35, off, 2, 0, 0, 10);
+        cs.push(cc("ds_swizzle_b32", op, op.to_vec(), &[10], &move |t| vec![dv(g(t) + rotate_source(off, t & 31))]));
+    }
+    for &mask in &[0x00u32, 0x10, 0x1f, 0x18, 0x1c, 0x1e, 0x01, 0x0f, 0x15, 0x08] {
+        let off = 0xe000 | mask;
+        let op = ds(0x35, off, 2, 0, 0, 10);
+        cs.push(cc("ds_swizzle_b32", op, op.to_vec(), &[10], &move |t| vec![dv(g(t) + fft_source(off, t & 31))]));
+    }
+    for &off in &[0xffe0u32, 0xf550, 0xfffe, 0xe3f1] {
+        let op = ds(0x35, off, 2, 0, 0, 10);
+        cs.push(cc("ds_swizzle_b32", op, op.to_vec(), &[10], &move |t| vec![dv(g(t) + fft_source(off, t & 31))]));
+    }
+    run_cs_cases("ds_swizzle_rotate_fft", &cs);
 }
 
 #[test]
