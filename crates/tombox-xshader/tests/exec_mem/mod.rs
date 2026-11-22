@@ -3,6 +3,7 @@ use tombox_xshader::hlsl::{TB_GMEM_SPACE, TB_MIP_SPACE};
 use tombox_xshader::meta::{RootParam, RootParamKind, RootRange, RootSig};
 
 mod bvh;
+mod branch;
 mod ds;
 mod gds;
 mod exp;

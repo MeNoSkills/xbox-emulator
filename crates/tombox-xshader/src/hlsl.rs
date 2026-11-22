@@ -773,6 +773,40 @@ fn lower_wave_reductions(insns: &mut [Insn]) -> Result<(), String> {
     Ok(())
 }
 
+fn resolve_far_jumps(insns: &mut [Insn]) {
+    let literal = |o: Option<&Opnd>| match o {
+        Some(Opnd::Literal(v)) => Some(*v as u64),
+        Some(Opnd::ConstInt(v)) if *v >= 0 => Some(*v as u64),
+        _ => None,
+    };
+    for i in 0..insns.len().saturating_sub(3) {
+        let (Some(Opnd::Sgpr(lo)), true) = (insns[i].dst.first().copied(), insns[i].mnemonic == "s_getpc_b64") else { continue };
+        let (add, addc, set) = (&insns[i + 1], &insns[i + 2], &insns[i + 3]);
+        let Some(k) = (add.mnemonic == "s_add_u32"
+            && add.dst.first() == Some(&Opnd::Sgpr(lo))
+            && add.src.first() == Some(&Opnd::Sgpr(lo)))
+        .then(|| literal(add.src.get(1)))
+        .flatten() else { continue };
+        let carries = addc.mnemonic == "s_addc_u32"
+            && addc.dst.first() == Some(&Opnd::Sgpr(lo + 1))
+            && addc.src.first() == Some(&Opnd::Sgpr(lo + 1))
+            && literal(addc.src.get(1)) == Some(0);
+        let jumps = set.mnemonic == "s_setpc_b64" && set.src.first() == Some(&Opnd::Sgpr(lo));
+        if !carries || !jumps || k % 4 != 0 {
+            continue;
+        }
+        let target = insns[i].offset as i64 + 4 + k as i64;
+        let from = insns[i + 3].offset as i64 + 4;
+        let branch = &mut insns[i + 3];
+        branch.enc = Enc::Sopp;
+        branch.op = 2;
+        branch.mnemonic = "s_branch".to_string();
+        branch.dst.clear();
+        branch.src.clear();
+        branch.aux.imm = (target - from) / 4;
+    }
+}
+
 fn lower_wave_scans(insns: &mut [Insn]) -> Result<(), String> {
     let is_dpp = |i: &Insn| i.enc == Enc::Vop2 && matches!(i.src.first(), Some(Opnd::Raw(233 | 234 | 250)));
     let mut first = 0;
@@ -1053,6 +1087,7 @@ fn translate_with(ex: &ShaderExtract, out_interp: &InputInterp, user_base_overri
         other => return Err(format!("stage {other:?} not supported yet")),
     };
     let mut insns = disassemble(&ex.isa);
+    resolve_far_jumps(&mut insns);
     let wave64 = mesh::wave_size(&insns) == 64;
     lower_wave_scans(&mut insns)?;
     lower_wave_reductions(&mut insns)?;
