@@ -3847,6 +3847,7 @@ impl<'a> Emitter<'a> {
                 Ok(())
             }
             Enc::Ds if matches!(m, "ds_permute_b32" | "ds_bpermute_b32") => self.emit_ds_permute(ins),
+            Enc::Ds if m == "ds_swizzle_b32" && self.is_cs => self.emit_ds_permute(ins),
             Enc::Ds if self.is_gs && matches!(m, "ds_read_b32" | "ds_read2_b32" | "ds_write_b32" | "ds_write2_b32") => {
                 self.emit_gs_lds(ins)
             }

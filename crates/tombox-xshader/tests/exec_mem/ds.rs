@@ -319,6 +319,37 @@ fn ds_permute_compute() {
 }
 
 #[test]
+fn ds_swizzle_compute() {
+    let mut cs = Vec::new();
+    let g = |t: u32| t & !31;
+    let bit = |off: u32, l: u32| (((l & (off & 0x1f)) | ((off >> 5) & 0x1f)) ^ ((off >> 10) & 0x1f)) & 31;
+    let quad = |off: u32, l: u32| (l & !3) | ((off >> (2 * (l & 3))) & 3);
+    for &off in &[0x001fu32, 0x041f, 0x081f, 0x101f, 0x401f, 0x0010, 0x03e0, 0x00a0, 0x0c1b, 0x7c00, 0x1fa5, 0x7fff] {
+        let op = ds(0x35, off, 2, 0, 0, 10);
+        cs.push(cc("ds_swizzle_b32", op, op.to_vec(), &[10], &move |t| vec![dv(g(t) + bit(off, t & 31))]));
+    }
+    for &m in &[0xe4u32, 0x1b, 0x55, 0xaa, 0x4e, 0xb1, 0x00, 0xff] {
+        let off = 0x8000 | m;
+        let op = ds(0x35, off, 2, 0, 0, 10);
+        cs.push(cc("ds_swizzle_b32", op, op.to_vec(), &[10], &move |t| vec![dv(g(t) + quad(off, t & 31))]));
+    }
+    run_cs_cases("ds_swizzle_cs", &cs);
+}
+
+#[test]
+fn ds_swizzle_rotate_and_fft_are_refused_in_compute() {
+    for &off in &[0xc000u32, 0xc01f, 0xe000, 0xe01f, 0xffff] {
+        let op = ds(0x35, off, 2, 0, 0, 10);
+        let w = cs_prog(&op, &[10]);
+        let e = match translate(&cs_extract(&w, T)) {
+            Ok(_) => panic!("ds_swizzle {off:#06x} translated"),
+            Err(e) => e,
+        };
+        assert!(e.contains("rotate and FFT"), "{off:#06x}: {e}");
+    }
+}
+
+#[test]
 fn ds_permute_with_lds_is_refused() {
     let mut b = perm_body(1, 0, 0);
     b.extend_from_slice(&ds(0x0d, 0, 1, 2, 0, 0));
