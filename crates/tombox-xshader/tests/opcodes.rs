@@ -640,3 +640,32 @@ fn image_get_lod_reads_both_lods() {
         &["tex0.CalculateLevelOfDetail(samp0, float2(asfloat(v1), asfloat(v2)))", "tex0.CalculateLevelOfDetailUnclamped(samp0,"],
     );
 }
+
+fn flat_dword0(op: u32, seg: u32, dlc: u32, glc: u32, slc: u32, offset: i32) -> u32 {
+    0xdc00_0000 | (op << 18) | (seg << 14) | (dlc << 12) | (glc << 16) | (slc << 17) | (offset as u32 & 0xfff)
+}
+
+fn decode_flat(dword0: u32) -> (String, i64, u8) {
+    let isa: Vec<u8> = [dword0, 0x7f01_0102u32].iter().flat_map(|w| w.to_le_bytes()).collect();
+    let ins = tombox_xshader::rdna2::disassemble(&isa).into_iter().next().expect("one instruction");
+    assert_eq!(ins.dwords, 2, "{dword0:#010x}");
+    (ins.mnemonic, ins.aux.imm, ins.aux.mask)
+}
+
+#[test]
+fn flat_global_and_scratch_offsets_do_not_take_the_dlc_bit() {
+    for dlc in [0u32, 1] {
+        for (glc, slc) in [(0u32, 0u32), (1, 1)] {
+            for off in [0i32, 4, 0x7ff, -1, -4, -0x800] {
+                let (m, imm, seg) = decode_flat(flat_dword0(0x0c, 2, dlc, glc, slc, off));
+                assert_eq!((m.as_str(), imm, seg), ("flat_load_dword", off as i64, 2), "global dlc={dlc} glc={glc} slc={slc} offset {off}");
+                let (m, imm, seg) = decode_flat(flat_dword0(0x0c, 1, dlc, glc, slc, off));
+                assert_eq!((m.as_str(), imm, seg), ("flat_load_dword", off as i64, 1), "scratch dlc={dlc} glc={glc} slc={slc} offset {off}");
+            }
+            for off in [0i32, 4, 0x7ff] {
+                let (m, imm, seg) = decode_flat(flat_dword0(0x0c, 0, dlc, glc, slc, off));
+                assert_eq!((m.as_str(), imm, seg), ("flat_load_dword", off as i64, 0), "flat dlc={dlc} glc={glc} slc={slc} offset {off}");
+            }
+        }
+    }
+}
