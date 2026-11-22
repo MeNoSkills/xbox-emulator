@@ -566,4 +566,5 @@ mod fract;
 mod lanes;
 mod leonida;
 mod rdna2_silicon;
+mod scratch;
 mod vopc;
